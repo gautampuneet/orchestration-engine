@@ -1,0 +1,32 @@
+{
+  "name": "Sample Workflow",
+  "nodes": [
+    {
+      "id": "fetch_data",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/data",
+        "method": "GET"
+      },
+      "dependencies": []
+    },
+    {
+      "id": "process_llm",
+      "handler": "llm_service",
+      "config": {
+        "prompt": "Analyze this data: {{ fetch_data.result }}",
+        "model": "gpt-4"
+      },
+      "dependencies": ["fetch_data"]
+    },
+    {
+      "id": "aggregate_results",
+      "handler": "aggregate",
+      "config": {
+        "inputs": ["{{ process_llm.result }}"],
+        "aggregate_type": "list"
+      },
+      "dependencies": ["process_llm"]
+    }
+  ]
+}

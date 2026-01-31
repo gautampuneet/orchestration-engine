@@ -1,0 +1,55 @@
+{
+  "nodes": [
+    {
+      "id": "root",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/data",
+        "method": "GET"
+      },
+      "dependencies": []
+    },
+    {
+      "id": "branch1",
+      "handler": "llm_service",
+      "config": {
+        "prompt": "Analyze data: {{ root.result }}",
+        "model": "gpt-4"
+      },
+      "dependencies": ["root"]
+    },
+    {
+      "id": "branch2",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/process/b",
+        "method": "POST",
+        "body": "{{ root.result }}"
+      },
+      "dependencies": ["root"]
+    },
+    {
+      "id": "branch3",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/process/c",
+        "method": "POST",
+        "body": "{{ root.result }}"
+      },
+      "dependencies": ["root"]
+    },
+    {
+      "id": "merge",
+      "handler": "aggregate",
+      "config": {
+        "inputs": [
+          "{{ branch1.result }}",
+          "{{ branch2.result }}",
+          "{{ branch3.result }}"
+        ],
+        "aggregate_type": "list"
+      },
+      "dependencies": ["branch1", "branch2", "branch3"]
+    }
+  ]
+}

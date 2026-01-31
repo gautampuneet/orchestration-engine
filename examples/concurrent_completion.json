@@ -1,0 +1,53 @@
+{
+  "nodes": [
+    {
+      "id": "A",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/service/a",
+        "method": "GET"
+      },
+      "dependencies": []
+    },
+    {
+      "id": "B",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/service/b",
+        "method": "GET"
+      },
+      "dependencies": []
+    },
+    {
+      "id": "C",
+      "handler": "llm_service",
+      "config": {
+        "prompt": "Process A: {{ A.result }}",
+        "model": "gpt-4"
+      },
+      "dependencies": ["A"]
+    },
+    {
+      "id": "D",
+      "handler": "llm_service",
+      "config": {
+        "prompt": "Process A again: {{ A.result }}",
+        "model": "gpt-4"
+      },
+      "dependencies": ["A"]
+    },
+    {
+      "id": "E",
+      "handler": "aggregate",
+      "config": {
+        "inputs": [
+          "{{ B.result }}",
+          "{{ C.result }}",
+          "{{ D.result }}"
+        ],
+        "aggregate_type": "list"
+      },
+      "dependencies": ["B", "C", "D"]
+    }
+  ]
+}

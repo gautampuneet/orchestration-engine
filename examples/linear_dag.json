@@ -1,0 +1,35 @@
+{
+  "nodes": [
+    {
+      "id": "A",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/data",
+        "method": "GET"
+      },
+      "dependencies": [],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "B",
+      "handler": "llm_service",
+      "config": {
+        "prompt": "Process data from A: {{ A.result }}",
+        "model": "gpt-4"
+      },
+      "dependencies": ["A"],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "C",
+      "handler": "call_external_service",
+      "config": {
+        "url": "https://api.example.com/submit",
+        "method": "POST",
+        "body": "{{ B.result }}"
+      },
+      "dependencies": ["B"],
+      "timeout_seconds": 300
+    }
+  ]
+}
