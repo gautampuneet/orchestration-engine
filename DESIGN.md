@@ -1,20 +1,60 @@
 # Design Doc
 
-## Goals
+## Introduction
 
-- Correctness under concurrent node completions (fan-in scenarios)
-- Exactly-once node execution despite retries and failures
-- Deterministic workflow execution
+This is a DAG-based workflow engine. You define workflows as directed acyclic graphs (nodes + dependencies), trigger them via API, and the orchestrator executes nodes in the right order. Results flow between nodes using templates like `{{ node_id.output }}`.
 
-## How nodes know they're ready
+The stack is FastAPI (API layer), Celery (task queue), Redis (state store), and Python workers. Three services run independently:
 
-Each node gets a counter set to the number of parents it has:
+- **API**: Validates workflows, stores DAGs, triggers execution
+- **Orchestrator**: Manages execution state, dispatches nodes when dependencies complete, handles failures
+- **Worker**: Runs the actual tasks (LLM calls, external APIs, etc.)
+
+We picked Redis + Celery because they're simple, fast, and we need atomic operations for correctness. Redis gives us `HINCRBY`, `SADD`, `SETNX` which are critical for handling concurrency without locks.
+
+## Design Goals
+
+Build a system that executes workflows correctly and predictably. That's it.
+
+Correctness means exactly-once execution even when Celery retries, nodes fail, or multiple parents complete at the same millisecond. Predictable means the same DAG always executes the same way.
+
+We're not building a feature-complete workflow engine. We're building something simple that works right.
+
+## Workflow Model
+
+A workflow is a DAG. Each node has:
+
+- `id`: unique identifier
+- `handler`: task type (like `llm_service` or `call_external_service`)
+- `config`: parameters for the task, can use templates
+- `dependencies`: list of parent node IDs
+- `timeout_seconds`: max execution time
+
+The API validates the DAG before storing it. No cycles, no missing dependencies, no duplicate IDs.
+
+## Execution Flow
+
+When you trigger a workflow:
+
+1. Orchestrator reads the DAG from Redis
+2. Initializes execution state (all nodes PENDING, counters set)
+3. Dispatches root nodes (nodes with zero dependencies)
+4. Each node goes: PENDING → RUNNING → COMPLETED (or FAILED)
+5. When a node completes, orchestrator decrements `deps_remaining` for its children
+6. When a child's counter hits zero, it gets dispatched
+7. Workflow completes when all nodes are COMPLETED or any node is FAILED
+
+Everything happens via Celery callbacks. Workers call back to orchestrator on success/failure, orchestrator dispatches next nodes.
+
+## Dependency Resolution
+
+Each node gets a counter initialized to its number of dependencies:
 
 ```python
-deps_remaining["C"] = 2  # C waits for A and B
+deps_remaining[node_id] = len(dependencies)
 ```
 
-When a parent finishes, we decrement atomically:
+When a parent completes, we atomically decrement:
 
 ```python
 remaining = redis.hincrby(f"exec:{id}:deps_remaining", child_id, -1)
@@ -22,86 +62,118 @@ if remaining == 0:
     dispatch_node(child_id)
 ```
 
-HINCRBY is atomic. Multiple parents can complete at the same time - only one will see the counter hit zero. That's when we dispatch.
+`HINCRBY` is atomic. If two parents finish at the exact same time, only one sees the counter hit zero. That's the one that dispatches.
 
-No polling needed. Nodes start as soon as their dependencies finish.
-
-## Fan-in (the tricky part)
-
-Say nodes A and B both finish at exactly the same millisecond. They both try to dispatch C. C should only run once.
-
-We use two guards:
-
-**Counter (HINCRBY)** - Atomic decrement. Only one parent sees the counter hit zero.
-
-**Dispatch set (SADD)** - Before dispatching, add to a set:
+Before dispatch, we also check:
 
 ```python
 if redis.sadd(f"exec:{id}:dispatched", node_id) == 0:
-    return  # already dispatched, bail out
+    return  # already dispatched
 ```
 
-SADD returns 0 if the element was already there. Defense in depth - even if the counter somehow fails, this catches it.
+`SADD` returns 0 if the element already exists. This is defense in depth. Even if something goes wrong with the counter, we won't dispatch twice.
 
-Together these handle race conditions without locks. HINCRBY detects readiness correctly. SADD ensures we only dispatch once.
+This handles fan-in (multiple parents → one child) safely without locks or coordination.
 
-## Making sure things run once
+## Template Resolution
 
-### Workers
+Nodes can reference outputs from parent nodes using Jinja2 templates:
 
-Before running anything:
+```json
+{
+  "prompt": "Summarize this: {{ nodeA.result }}"
+}
+```
+
+The orchestrator resolves templates before dispatching a node. It loads all completed outputs from Redis, builds a context dict, and renders the templates.
+
+We resolve in the orchestrator (not the worker) because the orchestrator already knows which nodes have completed. Workers shouldn't need to understand dependencies.
+
+## Idempotency
+
+Two places where duplicate execution could happen:
+
+### Worker
+
+Before running the task:
 
 ```python
 key = f"exec:{id}:taskdone:{id}:{node_id}"
 if not redis.setnx(key, "1"):
-    return  # already ran, skip it
+    return  # already ran
 ```
 
-SETNX only sets if the key doesn't exist. If Celery redelivers, we bail out early.
+`SETNX` only sets if the key doesn't exist. If Celery redelivers or retries, we skip the work.
 
 ### Orchestrator
 
-Same deal for completion callbacks:
+Before processing a completion callback:
 
 ```python
 completion_key = f"exec:{id}:completion_processed:{node_id}"
 if not redis.setnx(completion_key, "1"):
-    return  # already processed this completion
+    return  # already processed
 ```
 
 Prevents duplicate callbacks from decrementing counters twice or dispatching children multiple times.
 
-## When things fail
+These two guards guarantee exactly-once execution and exactly-once completion processing.
 
-Node fails → workflow immediately becomes FAILED:
+## Failure Handling
 
-```python
-meta["status"] = "FAILED"
-```
+When a node fails, the workflow immediately becomes FAILED. We mark the workflow status and propagate FAILED state to all downstream nodes (BFS traversal).
 
-Three guards stop everything from moving forward:
+Three guards ensure nothing moves forward after failure:
 
-**Success callback** - `on_node_success()` checks if workflow is FAILED. Late completions get ignored.
+1. `on_node_success()` checks workflow status, ignores late completions
+2. `_dispatch_node()` won't dispatch if workflow is FAILED
+3. `_check_workflow_completion()` never overwrites FAILED status
 
-**Dispatch check** - `_dispatch_node()` won't dispatch anything if workflow is FAILED.
+FAILED is terminal. Once set, it stays set. No new nodes get dispatched, no status transitions allowed.
 
-**Status guard** - `_check_workflow_completion()` never overwrites FAILED status.
+This is fail-fast. One node fails → entire workflow stops.
 
-FAILED is terminal. Nothing can unset it, nothing new can dispatch. Workflow's done.
+## Partial Retry Behavior
 
-## What we don't do
+If you re-trigger a FAILED workflow, the orchestrator only re-runs the failed nodes. Completed nodes are skipped.
 
-Some things are intentionally left out:
+How it works:
 
-**Workflow versioning** - Workflows are immutable once created. No upgrade path for running ones.
+1. Find all nodes with FAILED state
+2. Reset them to PENDING (clear `dispatched` and `completion_processed` flags)
+3. Recalculate their `deps_remaining` counters (only count dependencies that still need to run)
+4. Dispatch any failed nodes whose dependencies are already complete
 
-**Sub-workflows** - Nodes can't spawn child workflows. DAG stays flat.
+Completed nodes keep their outputs in Redis. Failed nodes can reference them via templates just like normal.
 
-**Durable persistence** - Everything's in Redis (7 day TTL). Use Redis persistence (AOF/RDB) or accept that restarting Redis kills in-flight workflows.
+This happens naturally from the existing idempotency + state logic. We don't have a special retry engine. We just reset the FAILED nodes and let the normal execution flow take over.
 
-We did add:
-- **Automatic retries** for external calls (5xx errors, network issues)
-- **Timeouts** via Celery task limits
-- **Smart workflow retry** to re-run just the failed parts
+## Correctness Invariants
 
-The goal is deterministic execution with strong correctness, not a feature-complete workflow engine. Each feature added increases state complexity. We're careful about that.
+The system relies on these atomic operations:
+
+- `SADD` → a node can only be dispatched once
+- `SETNX` (worker) → a node's task can only execute once
+- `SETNX` (orchestrator) → a completion can only be processed once
+- `HINCRBY` → dependency counters decrement atomically
+- Fail-fast guards → FAILED state is guaranteed terminal
+
+No distributed locks needed. Redis atomic operations give us what we need.
+
+## Non-Goals
+
+Things we explicitly don't do:
+
+- **No nested workflows**: Nodes can't spawn child workflows. DAG is flat.
+- **No scheduling**: No cron, no time-based triggers. You call the API to trigger.
+- **No worker routing**: All workers pull from the same queue. No node-to-worker affinity.
+- **No persistence outside Redis**: Everything lives in Redis with 7-day TTL. If Redis dies, in-flight workflows are gone (use Redis AOF/RDB if you need durability).
+- **No workflow versioning**: Once a workflow is triggered, its DAG is immutable. No hot-swapping definitions.
+
+## Future Improvements
+
+We have automatic retries (exponential backoff, respects `Retry-After` headers) and timeouts (Celery soft/hard limits). What's missing:
+
+- **Better persistence**: Write workflow state to Postgres or S3 for long-term storage
+- **Observability**: Emit metrics, traces, and structured events for monitoring
+- **Workflow versioning**: Support upgrading DAGs while keeping old executions running
